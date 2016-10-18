@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,8 +39,10 @@ func DUDU(args []string) error {
 		fmt.Printf("items are %#v\n", items)
 	}
 
-	counts := make(map[string]int64)
-	countsLock := &sync.Mutex{}
+	fileCounts := make(map[string]int64)
+	fileCountsLock := &sync.Mutex{}
+	dirCounts := make(map[string]int64)
+	dirCountsLock := &sync.Mutex{}
 
 	msgs := make(chan string, cfg.messageBuffer)
 	msgsDone := make(chan struct{})
@@ -75,20 +78,33 @@ func DUDU(args []string) error {
 	freeStatTasks := make(chan *statTask, cfg.parallelTasks)
 	for i := 0; i < cfg.parallelTasks; i++ {
 		freeStatTasks <- &statTask{}
-		go statter(cfg, counts, countsLock, msgs, errs, wg, statTasks, freeStatTasks)
+		go statter(cfg, fileCounts, fileCountsLock, dirCounts, dirCountsLock, msgs, errs, wg, statTasks, freeStatTasks)
 	}
 
-	for _, item := range items {
-		fi, err := os.Lstat(item)
+	if len(items) == 0 {
+		fi, err := os.Lstat(".")
 		if err != nil {
-			errs <- fmtErr(item, err)
-			continue
+			errs <- fmtErr(".", err)
+		} else {
+			ct := <-freeStatTasks
+			ct.item = "."
+			ct.fi = fi
+			wg.Add(1)
+			statTasks <- ct
 		}
-		ct := <-freeStatTasks
-		ct.item = item
-		ct.fi = fi
-		wg.Add(1)
-		statTasks <- ct
+	} else {
+		for _, item := range items {
+			fi, err := os.Lstat(item)
+			if err != nil {
+				errs <- fmtErr(item, err)
+				continue
+			}
+			ct := <-freeStatTasks
+			ct.item = item
+			ct.fi = fi
+			wg.Add(1)
+			statTasks <- ct
+		}
 	}
 
 	wg.Wait()
@@ -98,8 +114,51 @@ func DUDU(args []string) error {
 	close(errs)
 	<-errsDone
 
-	for _, item := range items {
-		fmt.Printf("%s %#v\n", item, counts[item])
+	bsit := func(n int64) int64 {
+		return (n + cfg.blockSize - 1) / cfg.blockSize
+	}
+
+	if len(items) == 0 {
+		items := make([]string, len(dirCounts))
+		i := 0
+		for item, _ := range dirCounts {
+			items[i] = item
+			i++
+		}
+		sort.Sort(sort.Reverse(sort.StringSlice(items)))
+		for _, item := range items {
+			fmt.Printf("%d\t%s\n", bsit(dirCounts[item]), item)
+		}
+	} else {
+		for _, item := range items {
+			fi, err := os.Lstat(item)
+			if err != nil {
+				errs <- fmtErr(item, err)
+				continue
+			}
+			if fi.IsDir() {
+				prefix := item
+				if item[len(item)-1] != '/' {
+					prefix += "/"
+				}
+				subitems := make([]string, len(dirCounts))
+				i := 0
+				for subitem, _ := range dirCounts {
+					if strings.HasPrefix(subitem, prefix) {
+						subitems[i] = subitem
+						i++
+					}
+				}
+				subitems = subitems[:i]
+				sort.Sort(sort.Reverse(sort.StringSlice(subitems)))
+				for _, subitem := range subitems {
+					fmt.Printf("%d\t%s\n", bsit(dirCounts[subitem]), subitem)
+				}
+				fmt.Printf("%d\t%s\n", bsit(dirCounts[item]), item)
+			} else {
+				fmt.Printf("%d\t%s\n", bsit(fileCounts[item]), item)
+			}
+		}
 	}
 
 	finalErrCount := atomic.LoadUint32(&errCount)
@@ -111,6 +170,7 @@ func DUDU(args []string) error {
 
 type config struct {
 	verbosity     int
+	blockSize     int64
 	parallelTasks int
 	readdirBuffer int
 	messageBuffer int
@@ -118,11 +178,9 @@ type config struct {
 }
 
 func parseArgs(args []string) (*config, []string, error) {
-	// TODO: Obviously a lot of this coded isn't needed right now. But it might
-	// be as I work toward a useful tool. We should clean this up once we're
-	// settled on a first version.
 	cfg := &config{
 		verbosity:     0,
+		blockSize:     1024,
 		parallelTasks: 100,
 		readdirBuffer: 1000,
 		messageBuffer: 1000,
@@ -130,7 +188,10 @@ func parseArgs(args []string) (*config, []string, error) {
 	}
 	var items []string
 	for i := 0; i < len(args); i++ {
-		if args[i] == "" || args[i][0] != '-' {
+		if args[i] == "" {
+			continue
+		}
+		if args[i][0] != '-' {
 			items = append(items, args[i])
 			continue
 		}
@@ -142,10 +203,10 @@ func parseArgs(args []string) (*config, []string, error) {
 		if args[i][1] == '-' {
 			opt := args[i][2:]
 			if !strings.Contains(opt, "=") {
-				if opt == "preserve" {
+				if opt == "B" || opt == "block-size" {
 					i++
 					if len(args) <= i {
-						return nil, nil, fmt.Errorf("--preserve requires a parameter")
+						return nil, nil, fmt.Errorf("--block-size requires a parameter")
 					}
 					opt += "=" + args[i]
 				}
@@ -154,30 +215,17 @@ func parseArgs(args []string) (*config, []string, error) {
 		} else {
 			for _, s := range args[i][1:] {
 				switch s {
-				case 'a':
-					opts = append(opts, "archive")
-				case 'd':
-					opts = append(opts, "no-dereference", "preserve=links")
-				case 'L':
-					opts = append(opts, "dereference")
-				case 'P':
-					opts = append(opts, "no-dereference")
-				case 'R', 'r':
-					opts = append(opts, "recursive")
+				case 'b':
+					opts = append(opts, "apparent-size", "block-size=1")
+				case 'k':
+					opts = append(opts, "block-size=1024")
+				case 'm':
+					opts = append(opts, "block-size=1048576")
 				case 'v':
 					opts = append(opts, "verbose")
 				}
 			}
 		}
-		var nopts []string
-		for _, opt := range opts {
-			if opt == "archive" {
-				nopts = append(nopts, "no-dereference", "recursive", "preserve=all")
-			} else {
-				nopts = append(nopts, opt)
-			}
-		}
-		opts = nopts
 		for _, opt := range opts {
 			var arg string
 			s := strings.SplitN(opt, "=", 2)
@@ -186,6 +234,20 @@ func parseArgs(args []string) (*config, []string, error) {
 				arg = s[1]
 			}
 			switch opt {
+			case "apparent-size":
+				// Fine to ignore; we always do apparent size for now.
+			case "block-size":
+				if arg == "" {
+					return nil, nil, fmt.Errorf("--block-size requires a parameter")
+				}
+				n, err := strconv.Atoi(arg)
+				if err != nil {
+					return nil, nil, fmt.Errorf("could not parse number %q for --block-size", arg)
+				}
+				if n < 1 {
+					n = 1
+				}
+				cfg.blockSize = int64(n)
 			case "help":
 				return nil, nil, HELP_TEXT
 			case "verbose":
@@ -230,7 +292,7 @@ func fmtErr(pth string, err error) string {
 	return rv
 }
 
-func statter(cfg *config, counts map[string]int64, countsLock *sync.Mutex, msgs chan string, errs chan string, wg *sync.WaitGroup, statTasks chan *statTask, freeStatTasks chan *statTask) {
+func statter(cfg *config, fileCounts map[string]int64, fileCountsLock *sync.Mutex, dirCounts map[string]int64, dirCountsLock *sync.Mutex, msgs chan string, errs chan string, wg *sync.WaitGroup, statTasks chan *statTask, freeStatTasks chan *statTask) {
 	var localTasks []*statTask
 	for {
 		var item string
@@ -258,16 +320,32 @@ func statter(cfg *config, counts map[string]int64, countsLock *sync.Mutex, msgs 
 		if cfg.verbosity > 0 {
 			msgs <- fmt.Sprintf("Statting %s", item)
 		}
-		countsLock.Lock()
-		countItem := item
-		for {
-			counts[countItem] += fi.Size()
-			if countItem == "." || countItem == "/" {
-				break
+		if fi.IsDir() {
+			dirCountsLock.Lock()
+			dirCountItem := item
+			for {
+				dirCounts[dirCountItem] += fi.Size()
+				if dirCountItem == "." || dirCountItem == "/" {
+					break
+				}
+				dirCountItem = path.Dir(dirCountItem)
 			}
-			countItem = path.Dir(countItem)
+			dirCountsLock.Unlock()
+		} else {
+			fileCountsLock.Lock()
+			fileCounts[item] += fi.Size()
+			fileCountsLock.Unlock()
+			dirCountsLock.Lock()
+			dirCountItem := path.Dir(item)
+			for {
+				dirCounts[dirCountItem] += fi.Size()
+				if dirCountItem == "." || dirCountItem == "/" {
+					break
+				}
+				dirCountItem = path.Dir(dirCountItem)
+			}
+			dirCountsLock.Unlock()
 		}
-		countsLock.Unlock()
 		if fi.IsDir() {
 			f, err := os.Open(item)
 			if err != nil {
