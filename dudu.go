@@ -22,6 +22,13 @@ Estimate disk space usage with parallelism; tries to be GNU du compatible.
 
 Currently supports the following options:
 
+--apparent-size
+-B --block-size=SIZE
+-b --bytes
+-h --human-readable
+-k
+-m
+-s --summarize
 --help
 
 Also has the following options:
@@ -229,16 +236,20 @@ func parseArgs(args []string) (*config, []string, error) {
 		var opts []string
 		if args[i][1] == '-' {
 			opt := args[i][2:]
-			if !strings.Contains(opt, "=") {
-				if opt == "B" || opt == "block-size" {
-					i++
-					if len(args) <= i {
-						return nil, nil, fmt.Errorf("--block-size requires a parameter")
+			if opt == "bytes" {
+				opts = append(opts, "apparent-size", "block-size=1")
+			} else {
+				if !strings.Contains(opt, "=") {
+					if opt == "B" || opt == "block-size" {
+						i++
+						if len(args) <= i {
+							return nil, nil, fmt.Errorf("--block-size requires a parameter")
+						}
+						opt += "=" + args[i]
 					}
-					opt += "=" + args[i]
 				}
+				opts = append(opts, opt)
 			}
-			opts = append(opts, opt)
 		} else {
 			for _, s := range args[i][1:] {
 				switch s {
