@@ -12,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+
+	"github.com/gholt/brimtext"
 )
 
 var HELP_TEXT = errors.New(strings.TrimSpace(`
@@ -114,8 +117,15 @@ func DUDU(args []string) error {
 	close(errs)
 	<-errsDone
 
-	bsit := func(n int64) int64 {
-		return (n + cfg.blockSize - 1) / cfg.blockSize
+	bsit := func(n int64) string {
+		if cfg.humanReadable {
+			return brimtext.HumanSize(n, "")
+		}
+		return fmt.Sprintf("%d", (n+cfg.blockSize-1)/cfg.blockSize)
+	}
+
+	if cfg.summarize && len(items) == 0 {
+		items = []string{"."}
 	}
 
 	if len(items) == 0 {
@@ -127,7 +137,7 @@ func DUDU(args []string) error {
 		}
 		sort.Sort(sort.Reverse(sort.StringSlice(items)))
 		for _, item := range items {
-			fmt.Printf("%d\t%s\n", bsit(dirCounts[item]), item)
+			fmt.Printf("%s\t%s\n", bsit(dirCounts[item]), item)
 		}
 	} else {
 		for _, item := range items {
@@ -137,26 +147,28 @@ func DUDU(args []string) error {
 				continue
 			}
 			if fi.IsDir() {
-				prefix := item
-				if item[len(item)-1] != '/' {
-					prefix += "/"
-				}
-				subitems := make([]string, len(dirCounts))
-				i := 0
-				for subitem, _ := range dirCounts {
-					if strings.HasPrefix(subitem, prefix) {
-						subitems[i] = subitem
-						i++
+				if !cfg.summarize {
+					prefix := item
+					if item[len(item)-1] != '/' {
+						prefix += "/"
+					}
+					subitems := make([]string, len(dirCounts))
+					i := 0
+					for subitem, _ := range dirCounts {
+						if strings.HasPrefix(subitem, prefix) {
+							subitems[i] = subitem
+							i++
+						}
+					}
+					subitems = subitems[:i]
+					sort.Sort(sort.Reverse(sort.StringSlice(subitems)))
+					for _, subitem := range subitems {
+						fmt.Printf("%s\t%s\n", bsit(dirCounts[subitem]), subitem)
 					}
 				}
-				subitems = subitems[:i]
-				sort.Sort(sort.Reverse(sort.StringSlice(subitems)))
-				for _, subitem := range subitems {
-					fmt.Printf("%d\t%s\n", bsit(dirCounts[subitem]), subitem)
-				}
-				fmt.Printf("%d\t%s\n", bsit(dirCounts[item]), item)
+				fmt.Printf("%s\t%s\n", bsit(dirCounts[item]), item)
 			} else {
-				fmt.Printf("%d\t%s\n", bsit(fileCounts[item]), item)
+				fmt.Printf("%s\t%s\n", bsit(fileCounts[item]), item)
 			}
 		}
 	}
@@ -171,6 +183,9 @@ func DUDU(args []string) error {
 type config struct {
 	verbosity     int
 	blockSize     int64
+	apparentSize  bool
+	summarize     bool
+	humanReadable bool
 	parallelTasks int
 	readdirBuffer int
 	messageBuffer int
@@ -180,23 +195,35 @@ type config struct {
 func parseArgs(args []string) (*config, []string, error) {
 	cfg := &config{
 		verbosity:     0,
-		blockSize:     1024,
+		blockSize:     512,
+		apparentSize:  false,
+		summarize:     false,
+		humanReadable: false,
 		parallelTasks: 100,
 		readdirBuffer: 1000,
 		messageBuffer: 1000,
 		errBuffer:     1000,
 	}
 	var items []string
+	mapitems := make(map[string]bool)
 	for i := 0; i < len(args); i++ {
 		if args[i] == "" {
 			continue
 		}
 		if args[i][0] != '-' {
-			items = append(items, args[i])
+			if !mapitems[args[i]] {
+				items = append(items, args[i])
+				mapitems[args[i]] = true
+			}
 			continue
 		}
 		if args[i] == "-" {
-			items = append(items, args[i+1:]...)
+			for _, item := range args[i+1:] {
+				if !mapitems[item] {
+					items = append(items, item)
+					mapitems[item] = true
+				}
+			}
 			continue
 		}
 		var opts []string
@@ -217,10 +244,14 @@ func parseArgs(args []string) (*config, []string, error) {
 				switch s {
 				case 'b':
 					opts = append(opts, "apparent-size", "block-size=1")
+				case 'h':
+					opts = append(opts, "human-readable")
 				case 'k':
 					opts = append(opts, "block-size=1024")
 				case 'm':
 					opts = append(opts, "block-size=1048576")
+				case 's':
+					opts = append(opts, "summarize")
 				case 'v':
 					opts = append(opts, "verbose")
 				}
@@ -235,7 +266,7 @@ func parseArgs(args []string) (*config, []string, error) {
 			}
 			switch opt {
 			case "apparent-size":
-				// Fine to ignore; we always do apparent size for now.
+				cfg.apparentSize = true
 			case "block-size":
 				if arg == "" {
 					return nil, nil, fmt.Errorf("--block-size requires a parameter")
@@ -250,6 +281,10 @@ func parseArgs(args []string) (*config, []string, error) {
 				cfg.blockSize = int64(n)
 			case "help":
 				return nil, nil, HELP_TEXT
+			case "human-readable":
+				cfg.humanReadable = true
+			case "summarize":
+				cfg.summarize = true
 			case "verbose":
 				cfg.verbosity++
 			case "x-parallel-tasks":
@@ -320,11 +355,17 @@ func statter(cfg *config, fileCounts map[string]int64, fileCountsLock *sync.Mute
 		if cfg.verbosity > 0 {
 			msgs <- fmt.Sprintf("Statting %s", item)
 		}
+		fiSize := fi.Size()
+		if !cfg.apparentSize {
+			if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+				fiSize = st.Blocks * 512
+			}
+		}
 		if fi.IsDir() {
 			dirCountsLock.Lock()
 			dirCountItem := item
 			for {
-				dirCounts[dirCountItem] += fi.Size()
+				dirCounts[dirCountItem] += fiSize
 				if dirCountItem == "." || dirCountItem == "/" {
 					break
 				}
@@ -333,12 +374,12 @@ func statter(cfg *config, fileCounts map[string]int64, fileCountsLock *sync.Mute
 			dirCountsLock.Unlock()
 		} else {
 			fileCountsLock.Lock()
-			fileCounts[item] += fi.Size()
+			fileCounts[item] += fiSize
 			fileCountsLock.Unlock()
 			dirCountsLock.Lock()
 			dirCountItem := path.Dir(item)
 			for {
-				dirCounts[dirCountItem] += fi.Size()
+				dirCounts[dirCountItem] += fiSize
 				if dirCountItem == "." || dirCountItem == "/" {
 					break
 				}
