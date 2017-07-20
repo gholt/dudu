@@ -126,7 +126,7 @@ func DUDU(args []string) error {
 
 	bsit := func(n int64) string {
 		if cfg.humanReadable {
-			return brimtext.HumanSize(n, "")
+			return brimtext.HumanSize1024(float64(n))
 		}
 		return fmt.Sprintf("%d", (n+cfg.blockSize-1)/cfg.blockSize)
 	}
